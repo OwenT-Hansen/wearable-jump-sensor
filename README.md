@@ -1,4 +1,4 @@
-# Jump Tracker
+# Wearable Jump Sensor
 
 Wearable vertical jump height tracker using ESP32 (Seeed XIAO ESP32C3) and MPU6050 (GY-521).
 
