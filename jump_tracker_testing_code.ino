@@ -1,5 +1,5 @@
 // basic_readings.ino
-// Now computing tilt-invariant total acceleration magnitude
+// Tilt-invariant total acceleration magnitude with per-axis calibration
 
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
@@ -7,6 +7,14 @@
 #include <math.h>
 
 Adafruit_MPU6050 mpu;
+
+// Per-axis calibration constants (calculated 2026-06-28)
+const float X_OFFSET =  0.3914;
+const float Y_OFFSET = -0.1574;
+const float Z_OFFSET = -1.1096;
+const float X_SCALE  =  0.9997;
+const float Y_SCALE  =  0.9961;
+const float Z_SCALE  =  0.9790;
 
 void setup() {
   Serial.begin(115200);
@@ -19,7 +27,7 @@ void setup() {
     while (1) delay(10);
   }
 
-  Serial.println("MPU6050 ready.");
+  Serial.println("MPU6050 ready. Calibration active.");
 
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
@@ -32,9 +40,10 @@ void loop() {
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
 
-  float aX = accel.acceleration.x;
-  float aY = accel.acceleration.y;
-  float aZ = accel.acceleration.z;
+  // Apply per-axis offset and scale correction
+  float aX = (accel.acceleration.x - X_OFFSET) * X_SCALE;
+  float aY = (accel.acceleration.y - Y_OFFSET) * Y_SCALE;
+  float aZ = (accel.acceleration.z - Z_OFFSET) * Z_SCALE;
 
   float totalAccel = sqrt(aX*aX + aY*aY + aZ*aZ);
 
@@ -43,5 +52,5 @@ void loop() {
   Serial.print(" aZ:"); Serial.print(aZ, 3);
   Serial.print(" | |a|:"); Serial.println(totalAccel, 3);
 
-  delay(50);  // ~20Hz sample rate — fine for now, may increase later
+  delay(50);
 }
