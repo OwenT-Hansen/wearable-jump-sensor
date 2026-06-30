@@ -43,3 +43,18 @@ corrected = (raw - offset) * scale
 
 After calibration, |a| = sqrt(aX² + aY² + aZ²) reads consistently at ~9.81 m/s² across 
 all orientations, confirming tilt-invariance. 
+
+## Milestone 5: Basic Jump Detection Working
+
+State machine (IDLE -> TAKEOFF -> AIRBORNE -> LANDING) successfully detecting jumps
+and storing height/flight time to onboard flash. Data retrieved via Serial Monitor
+on USB connect.
+
+Known issues:
+- Occasional false triggers under certain movement conditions
+- Height consistently underreported vs video ground truth (~200ms timing gap)
+
+Next steps:
+- Eliminate false triggers through threshold tuning and state machine refinement
+- Investigate timing gap root cause and implement correction
+- Per-user calibration routine
