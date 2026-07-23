@@ -58,3 +58,34 @@ Next steps:
 - Eliminate false triggers through threshold tuning and state machine refinement
 - Investigate timing gap root cause and implement correction
 - Per-user calibration routine
+
+
+
+
+
+
+
+## Project Pivot — Simplified Scope (July 2026)
+
+### New Objective
+Track two specific athletic jumps for performance measurement:
+- **Squat Jump (SJ):** No countermovement, hands at sides
+- **Countermovement Jump (CMJ):** Squat then explode upward, hands at sides
+
+Constraining to these two jump types eliminates signal processing complexity
+from arm swing and approach steps, making detection and measurement more
+reliable and the athletic data more meaningful.
+
+### CMJ/SJ Ratio
+The ratio of CMJ height to SJ height is a standard metric in sports science
+for measuring reactive strength and elastic energy utilization:
+- Ratio > 1.1: good use of stretch-shortening cycle
+- Ratio < 1.0: may indicate fatigue or poor neuromuscular coordination
+
+### Interface
+Bluetooth LE serial connection to Android phone via Serial Bluetooth Terminal app.
+Commands sent from phone, results printed back wirelessly. No USB required during use.
+
+### Deprecated
+Flash storage and USB Serial data retrieval removed in favor of live BLE output.
+Time series plotter buffer removed — may be reintroduced for diagnostics later.

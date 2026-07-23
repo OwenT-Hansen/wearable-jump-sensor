@@ -1,17 +1,22 @@
 // jump_tracker.ino
 // Wearable vertical jump height tracker
-// States: IDLE -> TAKEOFF -> AIRBORNE -> LANDING -> PLUGGED_IN
-// Unplug to record jumps, plug in and type 's' to see results, 'c' to clear
+// CMJ and SJ detection via WiFi web interface
+// Connect phone to "JumpTracker" WiFi, open 192.168.4.1
 
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <math.h>
-#include <MadgwickAHRS.h> 
 
-Adafruit_MPU6050 mpu;
-Preferences prefs;
+// ─────────────────────────────────────────
+// WiFi Access Point credentials
+// ─────────────────────────────────────────
+const char* AP_SSID = "JumpTracker";
+const char* AP_PASS = "jump1234";
+
+WebServer server(80);
 
 // ─────────────────────────────────────────
 // Calibration constants (calculated 2026-06-28)
@@ -25,36 +30,60 @@ const float Z_SCALE  =  0.9790;
 
 // ─────────────────────────────────────────
 // Thresholds
-// TAKEOFF_THRESHOLD: spike above this confirms explosive push-off
-// FREEFALL_THRESHOLD: drop below this confirms airborne
-// LANDING_THRESHOLD: spike above this confirms ground contact
-// TAKEOFF_WINDOW_MS: max time between takeoff spike and freefall
-//                    wide enough for approach jump arm swing delay
 // ─────────────────────────────────────────
-const float TAKEOFF_THRESHOLD  = 15.0;
-const float FREEFALL_THRESHOLD = 3;
-const float LANDING_THRESHOLD  = 12.0;
-const float TAKEOFF_WINDOW     = 500.0;
+const float TAKEOFF_THRESHOLD  = 18.0;
+const float FREEFALL_THRESHOLD = 9.0;
+const float LANDING_THRESHOLD  = 13.0;
+const int   MIN_FLIGHT_MS_SJ   = 100;
+const int   MIN_FLIGHT_MS_CMJ  = 300;
+const int   MAX_FLIGHT_MS      = 2000;
+const int   TAKEOFF_TIMEOUT_MS = 600;
+
+// ─────────────────────────────────────────
+// Jump types
+// ─────────────────────────────────────────
+enum JumpType { NONE, CMJ, SJ };
+JumpType currentJumpType = NONE;
 
 // ─────────────────────────────────────────
 // State machine
 // ─────────────────────────────────────────
-enum State { IDLE, TAKEOFF, AIRBORNE, LANDING, PLUGGED_IN };
+enum State { IDLE, ARMED, TAKEOFF, AIRBORNE, LANDING };
 State currentState = IDLE;
 
 // ─────────────────────────────────────────
 // Jump tracking
 // ─────────────────────────────────────────
-unsigned long airborneStart  = 0;
-unsigned long takeoffStart   = 0;
-float flightTimeSeconds      = 0;
-float jumpHeightMeters       = 0;
-int   jumpCount              = 0;
+unsigned long airborneStart = 0;
+unsigned long takeoffStart  = 0;
+
+// ─────────────────────────────────────────
+// Jump results
+// ─────────────────────────────────────────
+const int MAX_JUMPS = 20;
+float cmjResults[MAX_JUMPS];
+float sjResults[MAX_JUMPS];
+int   cmjCount = 0;
+int   sjCount  = 0;
+float lastCMJ  = 0;
+float lastSJ   = 0;
+String lastResult   = "No jump recorded yet.";
+String deviceStatus = "Idle — select a jump type.";
+
+// ─────────────────────────────────────────
+// Diagnostic buffer
+// ─────────────────────────────────────────
+const int DIAG_SAMPLES = 500;
+float diagBuffer[DIAG_SAMPLES];
+int   diagIndex = 0;
+
+// ─────────────────────────────────────────
+// MPU6050
+// ─────────────────────────────────────────
+Adafruit_MPU6050 mpu;
 
 // ─────────────────────────────────────────
 // Physics: h = 0.5 * g * (t/2)²
-// t/2 because flight is symmetric —
-// time to peak equals time falling back down
 // ─────────────────────────────────────────
 float calcHeight(float t) {
   float halfT = t / 2.0;
@@ -62,75 +91,225 @@ float calcHeight(float t) {
 }
 
 // ─────────────────────────────────────────
-// Flash storage
+// Ratio interpretation
 // ─────────────────────────────────────────
-void saveJump(float height, float flightTime) {
-  prefs.begin("jumps", false);
-  int stored = prefs.getInt("count", 0);
-  String key = "j" + String(stored);
-  String val = String(height, 4) + "," + String(flightTime, 4);
-  prefs.putString(key.c_str(), val.c_str());
-  prefs.putInt("count", stored + 1);
-  prefs.end();
+String interpretRatio(float ratio) {
+  if (ratio >= 1.15) return "Excellent elastic energy utilization";
+  if (ratio >= 1.08) return "Good elastic energy utilization";
+  if (ratio >= 1.00) return "Average stretch-shortening benefit";
+  return "Below average — CMJ not improving on SJ";
 }
 
-void dumpSummary() {
-  prefs.begin("jumps", true);
-  int count = prefs.getInt("count", 0);
+// ─────────────────────────────────────────
+// Results section builder
+// ─────────────────────────────────────────
+String buildResultsSection() {
+  String out = "";
 
-  Serial.println("=== Jump Summary ===");
-  Serial.print("Total jumps: ");
-  Serial.println(count);
-  Serial.println();
+  if (cmjCount > 0) {
+    float total = 0;
+    float best  = 0;
+    for (int i = 0; i < cmjCount; i++) {
+      total += cmjResults[i];
+      if (cmjResults[i] > best) best = cmjResults[i];
+    }
+    float avg = total / cmjCount;
 
-  if (count == 0) {
-    Serial.println("No jumps recorded.");
-    prefs.end();
-    return;
+    out += "<div class='card'>";
+    out += "<h2>CMJ Results</h2>";
+    out += "<p>Best: <b>" + String(best * 100.0, 1) + " cm</b></p>";
+    out += "<p>Average: <b>" + String(avg * 100.0, 1) + " cm</b></p>";
+    out += "<p>Jumps:</p><ul>";
+    for (int i = 0; i < cmjCount; i++) {
+      out += "<li>Jump " + String(i + 1) + ": " +
+             String(cmjResults[i] * 100.0, 1) + " cm</li>";
+    }
+    out += "</ul></div>";
   }
 
-  float best  = 0;
-  float total = 0;
+  if (sjCount > 0) {
+    float total = 0;
+    float best  = 0;
+    for (int i = 0; i < sjCount; i++) {
+      total += sjResults[i];
+      if (sjResults[i] > best) best = sjResults[i];
+    }
+    float avg = total / sjCount;
+
+    out += "<div class='card'>";
+    out += "<h2>SJ Results</h2>";
+    out += "<p>Best: <b>" + String(best * 100.0, 1) + " cm</b></p>";
+    out += "<p>Average: <b>" + String(avg * 100.0, 1) + " cm</b></p>";
+    out += "<p>Jumps:</p><ul>";
+    for (int i = 0; i < sjCount; i++) {
+      out += "<li>Jump " + String(i + 1) + ": " +
+             String(sjResults[i] * 100.0, 1) + " cm</li>";
+    }
+    out += "</ul></div>";
+  }
+
+  if (cmjCount == 0 && sjCount == 0) {
+    out += "<div class='card'><h2>Results</h2>"
+           "<p>No jumps recorded yet.</p></div>";
+  }
+
+  // ratio section
+  if (lastCMJ > 0 && lastSJ > 0) {
+    float ratio = lastCMJ / lastSJ;
+    out += "<div class='card'>"
+           "<h2>CMJ / SJ Ratio</h2>"
+           "<p>Last CMJ: <b>" + String(lastCMJ * 100.0, 1) + " cm</b></p>"
+           "<p>Last SJ:  <b>" + String(lastSJ  * 100.0, 1) + " cm</b></p>"
+           "<p>Ratio: <b>" + String(ratio, 2) + "</b></p>"
+           "<p>" + interpretRatio(ratio) + "</p>"
+           "</div>";
+  }
+
+  return out;
+}
+
+// ─────────────────────────────────────────
+// Main web page
+// ─────────────────────────────────────────
+String buildPage() {
+  String html = R"(<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <meta http-equiv='refresh' content='2'>
+  <title>Jump Tracker</title>
+  <style>
+    body  { font-family:Arial,sans-serif; max-width:400px; margin:0 auto; padding:20px; background:#1a1a2e; color:#eee; }
+    h1    { color:#00d4ff; text-align:center; }
+    h2    { color:#00d4ff; margin-top:0; }
+    .status { background:#16213e; padding:15px; border-radius:8px; margin:15px 0; text-align:center; font-size:1.1em; }
+    .btn  { display:block; width:100%; padding:18px; margin:10px 0; font-size:1.2em; font-weight:bold; border:none; border-radius:8px; cursor:pointer; box-sizing:border-box; }
+    .cmj  { background:#00d4ff; color:#1a1a2e; }
+    .sj   { background:#00ff88; color:#1a1a2e; }
+    .reset{ background:#ff4444; color:white; }
+    .diag { background:#555; color:white; font-size:0.9em; padding:12px; }
+    .card { background:#16213e; padding:15px; border-radius:8px; margin:15px 0; }
+    p     { margin:8px 0; }
+    ul    { margin:5px 0; padding-left:20px; }
+    li    { margin:4px 0; font-size:0.95em; }
+  </style>
+</head>
+<body>
+  <h1>Jump Tracker</h1>
+  <div class='status'>)" + deviceStatus + R"(</div>
+  <form action='/cmj' method='get'>
+    <button class='btn cmj' type='submit'>Countermovement Jump (CMJ)</button>
+  </form>
+  <form action='/sj' method='get'>
+    <button class='btn sj' type='submit'>Squat Jump (SJ)</button>
+  </form>
+  )" + buildResultsSection() + R"(
+  <form action='/reset' method='get'>
+    <button class='btn reset' type='submit'>Reset Results</button>
+  </form>
+  <form action='/diag' method='get'>
+    <button class='btn diag' type='submit'>View Diagnostic Graph</button>
+  </form>
+</body>
+</html>)";
+
+  return html;
+}
+
+// ─────────────────────────────────────────
+// Diagnostic page
+// ─────────────────────────────────────────
+void handleDiag() {
+  String bars = "";
+  int count = min(diagIndex, DIAG_SAMPLES);
 
   for (int i = 0; i < count; i++) {
-    String key = "j" + String(i);
-    String val = prefs.getString(key.c_str(), "");
-    int comma  = val.indexOf(',');
-    float h    = val.substring(0, comma).toFloat();
-    float t    = val.substring(comma + 1).toFloat();
+    float val = diagBuffer[i];
+    int pct = (int)((val / 30.0) * 100.0);
+    if (pct > 100) pct = 100;
 
-    Serial.print("  Jump ");
-    Serial.print(i + 1);
-    Serial.print(": ");
-    Serial.print(h * 100.0, 1);
-    Serial.print(" cm | flight time: ");
-    Serial.print(t, 3);
-    Serial.println(" s");
+    String color = "#00d4ff";
+    if (val < FREEFALL_THRESHOLD) color = "#00ff88";
+    if (val > LANDING_THRESHOLD)  color = "#ff4444";
 
-    total += h;
-    if (h > best) best = h;
+    bars += "<div style='display:flex;align-items:center;margin:1px 0;'>"
+            "<span style='width:38px;font-size:10px;color:#aaa;'>"
+            + String(val, 1) + "</span>"
+            "<div style='height:12px;width:" + String(pct) +
+            "%;background:" + color + ";'></div></div>";
   }
 
-  Serial.println();
-  Serial.print("  Best:    ");
-  Serial.print(best * 100.0, 1);
-  Serial.println(" cm");
-  Serial.print("  Average: ");
-  Serial.print((total / count) * 100.0, 1);
-  Serial.println(" cm");
-  Serial.println();
-  Serial.println("=== End Summary ===");
-  Serial.println();
-  Serial.println("Commands: 's' = summary | 'c' = clear log");
-  prefs.end();
+  String html = R"(<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>Jump Diagnostic</title>
+  <style>
+    body { background:#1a1a2e; color:#eee; font-family:Arial,sans-serif; padding:10px; }
+    h2   { color:#00d4ff; }
+    .legend { margin:10px 0; font-size:12px; }
+    .legend span { margin-right:15px; }
+  </style>
+</head>
+<body>
+  <h2>Jump Diagnostic</h2>
+  <div class='legend'>
+    <span style='color:#00ff88'>■ Freefall (&lt;)" + String(FREEFALL_THRESHOLD, 1) + R"()</span>
+    <span style='color:#ff4444'>■ Landing (&gt;)" + String(LANDING_THRESHOLD, 1) + R"()</span>
+    <span style='color:#00d4ff'>■ Normal</span>
+  </div>
+  <p style='font-size:12px;color:#aaa'>)" + String(count) + " samples | " +
+    String(count * 5) + R"(ms total</p>
+  )" + bars + R"(
+  <br>
+  <a href='/' style='color:#00d4ff'>← Back</a>
+</body>
+</html>)";
+
+  server.send(200, "text/html", html);
 }
 
-void clearLog() {
-  prefs.begin("jumps", false);
-  prefs.clear();
-  prefs.end();
-  jumpCount = 0;
-  Serial.println("Log cleared. Unplug to begin new session.");
+// ─────────────────────────────────────────
+// Web server route handlers
+// ─────────────────────────────────────────
+void handleRoot() {
+  server.send(200, "text/html", buildPage());
+}
+
+void handleCMJ() {
+  currentJumpType = CMJ;
+  currentState    = ARMED;
+  diagIndex       = 0;
+  deviceStatus    = "CMJ armed — stand still then jump.";
+  lastResult      = "Waiting for jump...";
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSJ() {
+  currentJumpType = SJ;
+  currentState    = ARMED;
+  diagIndex       = 0;
+  deviceStatus    = "SJ armed — hold squat then jump.";
+  lastResult      = "Waiting for jump...";
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleReset() {
+  lastCMJ         = 0;
+  lastSJ          = 0;
+  cmjCount        = 0;
+  sjCount         = 0;
+  currentJumpType = NONE;
+  currentState    = IDLE;
+  diagIndex       = 0;
+  deviceStatus    = "Reset — select a jump type.";
+  lastResult      = "No jump recorded yet.";
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
 // ─────────────────────────────────────────
@@ -140,17 +319,28 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Wire.begin(4, 5);  // SDA=GPIO4 (D2), SCL=GPIO5 (D3)
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(500);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 
+  Wire.begin(4, 5);
   if (!mpu.begin()) {
-    while (1) delay(10);  // fatal — freeze
+    Serial.println("MPU6050 not found");
+    while (1) delay(10);
   }
-
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  
-  delay(100);
+
+  server.on("/",      handleRoot);
+  server.on("/cmj",   handleCMJ);
+  server.on("/sj",    handleSJ);
+  server.on("/reset", handleReset);
+  server.on("/diag",  handleDiag);
+  server.begin();
+
+  Serial.println("Ready — connect to JumpTracker WiFi then open 192.168.4.1");
 }
 
 // ─────────────────────────────────────────
@@ -158,32 +348,21 @@ void setup() {
 // ─────────────────────────────────────────
 void loop() {
 
-  // ── Serial input handler ─────────────────
-  if (Serial.available() > 0) {
-    char cmd = Serial.read();
-
-    if (currentState != PLUGGED_IN) {
-      currentState = PLUGGED_IN;
-      delay(1000);
-      Serial.println("\n=== USB Connected ===");
-      Serial.println("Commands: 's' = summary | 'c' = clear log");
-      Serial.println();
-    }
-
-    if (cmd == 's') {
-      dumpSummary();
-    } else if (cmd == 'c') {
-      clearLog();
-    }
+  // block WiFi during timing-critical states
+  if (currentState != AIRBORNE && currentState != TAKEOFF) {
+    server.handleClient();
   }
 
-  // ── PLUGGED_IN state ─────────────────────
-  if (currentState == PLUGGED_IN) {
-    if (!Serial) {
-      currentState = IDLE;
-    } else {
-      delay(100);
-    }
+  if (currentState == IDLE) {
+    delay(5);
+    return;
+  }
+
+  if (currentState == LANDING) {
+    delay(1500);
+    currentState    = IDLE;
+    currentJumpType = NONE;
+    deviceStatus    = "Jump complete — select next jump type.";
     return;
   }
 
@@ -195,64 +374,79 @@ void loop() {
   float aY = (accel.acceleration.y - Y_OFFSET) * Y_SCALE;
   float aZ = (accel.acceleration.z - Z_OFFSET) * Z_SCALE;
   float totalAccel = sqrt(aX*aX + aY*aY + aZ*aZ);
-  
-  
+
+  // record to diagnostic buffer
+  if (diagIndex < DIAG_SAMPLES) {
+    diagBuffer[diagIndex++] = totalAccel;
+  }
 
   // ── State machine ─────────────────────────
   switch (currentState) {
 
-    case IDLE:
-      // waiting for explosive push-off spike
+    case ARMED:
       if (totalAccel > TAKEOFF_THRESHOLD) {
         currentState = TAKEOFF;
         takeoffStart = millis();
+        deviceStatus = "Takeoff detected...";
       }
       break;
 
     case TAKEOFF:
-      // spike detected — now wait for freefall to confirm real jump
-      // if freefall doesnt follow within the window, it was a false spike
       if (totalAccel < FREEFALL_THRESHOLD) {
         currentState  = AIRBORNE;
-        airborneStart = millis();
-      } else if ((millis() - takeoffStart) > TAKEOFF_WINDOW) {
-        // no freefall within 500ms — false spike, reset to IDLE
-        currentState = IDLE;
+        airborneStart = micros();
+        deviceStatus  = "Airborne...";
+      } else if ((millis() - takeoffStart) > TAKEOFF_TIMEOUT_MS) {
+        currentState = ARMED;
+        deviceStatus = (currentJumpType == CMJ) ?
+          "CMJ armed — stand still then jump." :
+          "SJ armed — hold squat then jump.";
       }
       break;
 
-    case AIRBORNE:
-      // ignore landing for first 200ms
-      // filters noise during transition from takeoff to freefall
-      if ((millis() - airborneStart) < 200) break;
+    case AIRBORNE: {
+      unsigned long timeInAir = (micros() - airborneStart) / 1000;
 
-      // timeout — stuck in freefall, reset
-      if ((millis() - airborneStart) > 2000) {
-        currentState = IDLE;
+      if (timeInAir > MAX_FLIGHT_MS) {
+        currentState = ARMED;
+        deviceStatus = "Timeout — try again.";
+        diagIndex    = 0;
         break;
       }
 
-      // timeout — stuck in freefall, reset
-      if ((millis() - airborneStart) > 1000) {
-        currentState = IDLE;
-        break;
-      }
+      int minFlight = (currentJumpType == CMJ) ? MIN_FLIGHT_MS_CMJ : MIN_FLIGHT_MS_SJ;
+      if (timeInAir < minFlight) break;
 
       if (totalAccel > LANDING_THRESHOLD) {
-        currentState      = LANDING;
-        flightTimeSeconds = (millis() - airborneStart) / 1000.0;
-        jumpHeightMeters  = calcHeight(flightTimeSeconds);
-        saveJump(jumpHeightMeters, flightTimeSeconds);
-        jumpCount++;
+        currentState     = LANDING;
+        float flightTime = timeInAir / 1000.0;
+        float height     = calcHeight(flightTime);
+        String label     = (currentJumpType == CMJ) ? "CMJ" : "SJ";
+
+        if (currentJumpType == CMJ) {
+          lastCMJ = height;
+          if (cmjCount < MAX_JUMPS) cmjResults[cmjCount++] = height;
+        }
+        if (currentJumpType == SJ) {
+          lastSJ = height;
+          if (sjCount < MAX_JUMPS) sjResults[sjCount++] = height;
+        }
+
+        lastResult = label + ": " + String(height * 100.0, 1) +
+                     " cm | flight time: " + String(flightTime, 3) + "s";
+
+        if (lastCMJ > 0 && lastSJ > 0) {
+          float ratio  = lastCMJ / lastSJ;
+          deviceStatus = "Done! CMJ/SJ ratio: " + String(ratio, 2);
+        } else {
+          deviceStatus = label + " complete! Do next jump or view diagnostic.";
+        }
       }
       break;
+    }
 
+    case IDLE:
     case LANDING:
-      delay(500);  // let impact vibration settle
-      currentState = IDLE;
-      break;
-
-    case PLUGGED_IN:
       break;
   }
 
