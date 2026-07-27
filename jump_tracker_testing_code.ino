@@ -1,7 +1,6 @@
 // jump_tracker.ino
-// Wearable vertical jump height tracker
-// CMJ and SJ detection via WiFi web interface
-// Connect phone to "JumpTracker" WiFi, open 192.168.4.1
+// wearable vertical jump height tracker for squat jumps and countermovement jumps
+// connects to phone via wifi - open 192.168.4.1 in browser after connecting to JumpTracker network
 
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
@@ -10,17 +9,14 @@
 #include <WebServer.h>
 #include <math.h>
 
-// ─────────────────────────────────────────
-// WiFi Access Point credentials
-// ─────────────────────────────────────────
+// wifi access point - chip creates its own hotspot, no router needed
 const char* AP_SSID = "JumpTracker";
 const char* AP_PASS = "jump1234";
 
 WebServer server(80);
 
-// ─────────────────────────────────────────
-// Calibration constants (calculated 2026-06-28)
-// ─────────────────────────────────────────
+// per-axis offset and scale corrections calculated from 6-point calibration on 2026-06-28
+// each axis has its own bias so a single global correction wasnt enough
 const float X_OFFSET =  0.3914;
 const float Y_OFFSET = -0.1574;
 const float Z_OFFSET = -1.1096;
@@ -28,39 +24,35 @@ const float X_SCALE  =  0.9997;
 const float Y_SCALE  =  0.9961;
 const float Z_SCALE  =  0.9790;
 
-// ─────────────────────────────────────────
-// Thresholds
-// ─────────────────────────────────────────
-const float TAKEOFF_THRESHOLD  = 18.0;
-const float FREEFALL_THRESHOLD_CMJ = 9.0;
-const float FREEFALL_THRESHOLD_SJ  = 8.0;
-const float LANDING_THRESHOLD  = 9.0;
-const int   MIN_FLIGHT_MS_SJ   = 200;
-const int   MIN_FLIGHT_MS_CMJ  = 300;
-const int   MAX_FLIGHT_MS      = 2000;
-const int   TAKEOFF_TIMEOUT_MS = 600;
+// detection thresholds - tuned through testing
+// takeoff: push-off leg drive spike before leaving the ground
+// freefall: signal drops below gravity as feet leave ground
+//           cmj uses a higher threshold because the countermovement unloads faster
+// landing: impact spike on ground contact
+// timeouts: prevent getting stuck in a state if something goes wrong
+const float TAKEOFF_THRESHOLD      = 18.0;
+const float FREEFALL_THRESHOLD_CMJ =  9.0;
+const float FREEFALL_THRESHOLD_SJ  =  8.0;
+const float LANDING_THRESHOLD      = 10.0;
+const int   MIN_FLIGHT_MS_CMJ      =  300;
+const int   MIN_FLIGHT_MS_SJ       =  200;
+const int   MAX_FLIGHT_MS          = 2000;
+const int   TAKEOFF_TIMEOUT_MS     =  600;
 
-// ─────────────────────────────────────────
-// Jump types
-// ─────────────────────────────────────────
+// jump types
 enum JumpType { NONE, CMJ, SJ };
 JumpType currentJumpType = NONE;
 
-// ─────────────────────────────────────────
-// State machine
-// ─────────────────────────────────────────
+// state machine - order matters, chip moves through these in sequence for each jump
+// idle -> armed -> takeoff -> airborne -> landing -> back to idle
 enum State { IDLE, ARMED, TAKEOFF, AIRBORNE, LANDING };
 State currentState = IDLE;
 
-// ─────────────────────────────────────────
-// Jump tracking
-// ─────────────────────────────────────────
+// timing variables - micros() used for airborne to get sub-millisecond precision
 unsigned long airborneStart = 0;
 unsigned long takeoffStart  = 0;
 
-// ─────────────────────────────────────────
-// Jump results
-// ─────────────────────────────────────────
+// stores up to 20 jumps per type per session, resets on power cycle
 const int MAX_JUMPS = 20;
 float cmjResults[MAX_JUMPS];
 float sjResults[MAX_JUMPS];
@@ -71,30 +63,25 @@ float lastSJ   = 0;
 String lastResult   = "No jump recorded yet.";
 String deviceStatus = "Idle — select a jump type.";
 
-// ─────────────────────────────────────────
-// Diagnostic buffer
-// ─────────────────────────────────────────
+// diagnostic buffer - records raw acceleration during each jump
+// viewable at 192.168.4.1/diag as a color coded bar chart
 const int DIAG_SAMPLES = 500;
 float diagBuffer[DIAG_SAMPLES];
 int   diagIndex = 0;
 
-// ─────────────────────────────────────────
-// MPU6050
-// ─────────────────────────────────────────
 Adafruit_MPU6050 mpu;
 
-// ─────────────────────────────────────────
-// Physics: h = 0.5 * g * (t/2)²
-// ─────────────────────────────────────────
+// standard flight time to height conversion
+// uses half the total flight time because the jump is symmetric -
+// time going up equals time coming down
+// 7.1cm offset applied based on 20-jump empirical calibration against known height
 float calcHeight(float t) {
   float halfT = t / 2.0;
   float raw   = 0.5 * 9.81 * halfT * halfT;
-  return max(0.0f, raw - 0.071f);  // 7.1cm empirical calibration offset
+  return max(0.0f, raw - 0.071f);
 }
 
-// ─────────────────────────────────────────
-// Ratio interpretation
-// ─────────────────────────────────────────
+// cmj/sj ratio benchmarks from sports science literature
 String interpretRatio(float ratio) {
   if (ratio >= 1.15) return "Excellent elastic energy utilization";
   if (ratio >= 1.08) return "Good elastic energy utilization";
@@ -102,9 +89,7 @@ String interpretRatio(float ratio) {
   return "Below average — CMJ not improving on SJ";
 }
 
-// ─────────────────────────────────────────
-// Results section builder
-// ─────────────────────────────────────────
+// builds the results cards for both jump types including best, average, and full history
 String buildResultsSection() {
   String out = "";
 
@@ -116,7 +101,6 @@ String buildResultsSection() {
       if (cmjResults[i] > best) best = cmjResults[i];
     }
     float avg = total / cmjCount;
-
     out += "<div class='card'>";
     out += "<h2>CMJ Results</h2>";
     out += "<p>Best: <b>" + String(best * 100.0, 1) + " cm</b></p>";
@@ -137,7 +121,6 @@ String buildResultsSection() {
       if (sjResults[i] > best) best = sjResults[i];
     }
     float avg = total / sjCount;
-
     out += "<div class='card'>";
     out += "<h2>SJ Results</h2>";
     out += "<p>Best: <b>" + String(best * 100.0, 1) + " cm</b></p>";
@@ -155,13 +138,13 @@ String buildResultsSection() {
            "<p>No jumps recorded yet.</p></div>";
   }
 
-  // ratio section
+  // ratio only shows once both jump types have been recorded
   if (lastCMJ > 0 && lastSJ > 0) {
     float ratio = lastCMJ / lastSJ;
     out += "<div class='card'>"
            "<h2>CMJ / SJ Ratio</h2>"
            "<p>Last CMJ: <b>" + String(lastCMJ * 100.0, 1) + " cm</b></p>"
-           "<p>Last SJ:  <b>" + String(lastSJ  * 100.0, 1) + " cm</b></p>"
+           "<p>Last SJ: <b>"  + String(lastSJ  * 100.0, 1) + " cm</b></p>"
            "<p>Ratio: <b>" + String(ratio, 2) + "</b></p>"
            "<p>" + interpretRatio(ratio) + "</p>"
            "</div>";
@@ -170,9 +153,7 @@ String buildResultsSection() {
   return out;
 }
 
-// ─────────────────────────────────────────
-// Main web page
-// ─────────────────────────────────────────
+// main page - auto refreshes every 2 seconds so results appear without manual reload
 String buildPage() {
   String html = R"(<!DOCTYPE html>
 <html>
@@ -219,9 +200,9 @@ String buildPage() {
   return html;
 }
 
-// ─────────────────────────────────────────
-// Diagnostic page
-// ─────────────────────────────────────────
+// diagnostic page - color coded bar chart of the raw acceleration signal
+// green = below freefall threshold, red = above landing threshold, blue = normal
+// useful for verifying the state machine is detecting jumps correctly
 void handleDiag() {
   String bars = "";
   int count = min(diagIndex, DIAG_SAMPLES);
@@ -232,7 +213,8 @@ void handleDiag() {
     if (pct > 100) pct = 100;
 
     String color = "#00d4ff";
-    "<span style='color:#00ff88'>■ Freefall</span>";
+    if (val < FREEFALL_THRESHOLD_CMJ) color = "#00ff88";
+    if (val > LANDING_THRESHOLD)      color = "#ff4444";
 
     bars += "<div style='display:flex;align-items:center;margin:1px 0;'>"
             "<span style='width:38px;font-size:10px;color:#aaa;'>"
@@ -257,24 +239,21 @@ void handleDiag() {
 <body>
   <h2>Jump Diagnostic</h2>
   <div class='legend'>
-    <span style='color:#00ff88'>■ Freefall</span>
-    <span style='color:#ff4444'>■ Landing (&gt;)" + String(LANDING_THRESHOLD, 1) + R"()</span>
-    <span style='color:#00d4ff'>■ Normal</span>
+    <span style='color:#00ff88'>&#9632; Freefall</span>
+    <span style='color:#ff4444'>&#9632; Landing (&gt;)" + String(LANDING_THRESHOLD, 1) + R"()</span>
+    <span style='color:#00d4ff'>&#9632; Normal</span>
   </div>
   <p style='font-size:12px;color:#aaa'>)" + String(count) + " samples | " +
     String(count * 5) + R"(ms total</p>
   )" + bars + R"(
   <br>
-  <a href='/' style='color:#00d4ff'>← Back</a>
+  <a href='/' style='color:#00d4ff'>&larr; Back</a>
 </body>
 </html>)";
 
   server.send(200, "text/html", html);
 }
 
-// ─────────────────────────────────────────
-// Web server route handlers
-// ─────────────────────────────────────────
 void handleRoot() {
   server.send(200, "text/html", buildPage());
 }
@@ -293,7 +272,7 @@ void handleSJ() {
   currentJumpType = SJ;
   currentState    = ARMED;
   diagIndex       = 0;
-  deviceStatus    = "SJ armed — hold squat then jump.";
+  deviceStatus    = "SJ armed — hold squat position then jump.";
   lastResult      = "Waiting for jump...";
   server.sendHeader("Location", "/");
   server.send(303);
@@ -313,23 +292,25 @@ void handleReset() {
   server.send(303);
 }
 
-// ─────────────────────────────────────────
-// Setup
-// ─────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(500);
 
+  // wifi starts before the sensor to avoid initialization conflicts
   WiFi.softAP(AP_SSID, AP_PASS);
   delay(500);
-  Serial.print("AP IP: ");
+  Serial.print("access point started at: ");
   Serial.println(WiFi.softAPIP());
 
-  Wire.begin(4, 5);
+  Wire.begin(4, 5);  // sda = gpio4 (d2), scl = gpio5 (d3)
   if (!mpu.begin()) {
-    Serial.println("MPU6050 not found");
+    Serial.println("mpu6050 not found - check wiring");
     while (1) delay(10);
   }
+
+  // range and filter settings chosen for jump detection
+  // 8g range captures the full push-off and landing spike without clipping
+  // 21hz filter removes high frequency vibration noise while keeping jump signal intact
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
@@ -341,15 +322,13 @@ void setup() {
   server.on("/diag",  handleDiag);
   server.begin();
 
-  Serial.println("Ready — connect to JumpTracker WiFi then open 192.168.4.1");
+  Serial.println("ready - connect phone to JumpTracker wifi then open 192.168.4.1");
 }
 
-// ─────────────────────────────────────────
-// Main loop
-// ─────────────────────────────────────────
 void loop() {
 
-  // block WiFi during timing-critical states
+  // wifi packet handling is blocked during takeoff and airborne states
+  // even a short wifi interrupt can corrupt the flight timer
   if (currentState != AIRBORNE && currentState != TAKEOFF) {
     server.handleClient();
   }
@@ -359,6 +338,8 @@ void loop() {
     return;
   }
 
+  // landing settle delay - gives time for impact vibration to die down
+  // before resetting to idle and accepting the next jump command
   if (currentState == LANDING) {
     delay(1500);
     currentState    = IDLE;
@@ -367,24 +348,26 @@ void loop() {
     return;
   }
 
-  // ── Read and calibrate sensor ─────────────
+  // read sensor and apply per-axis calibration correction
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
 
   float aX = (accel.acceleration.x - X_OFFSET) * X_SCALE;
   float aY = (accel.acceleration.y - Y_OFFSET) * Y_SCALE;
   float aZ = (accel.acceleration.z - Z_OFFSET) * Z_SCALE;
+
+  // total acceleration magnitude - tilt invariant so sensor angle doesnt matter
   float totalAccel = sqrt(aX*aX + aY*aY + aZ*aZ);
 
-  // record to diagnostic buffer
   if (diagIndex < DIAG_SAMPLES) {
     diagBuffer[diagIndex++] = totalAccel;
   }
 
-  // ── State machine ─────────────────────────
   switch (currentState) {
 
     case ARMED:
+      // waiting for the push-off spike that confirms an intentional jump
+      // prevents squat dips or accidental movement from triggering detection
       if (totalAccel > TAKEOFF_THRESHOLD) {
         currentState = TAKEOFF;
         takeoffStart = millis();
@@ -393,6 +376,8 @@ void loop() {
       break;
 
     case TAKEOFF: {
+      // waiting for the signal to drop below gravity, meaning feet left the ground
+      // cmj and sj have different thresholds because their unloading profiles differ
       float freefallThresh = (currentJumpType == CMJ) ?
         FREEFALL_THRESHOLD_CMJ : FREEFALL_THRESHOLD_SJ;
 
@@ -401,10 +386,11 @@ void loop() {
         airborneStart = micros();
         deviceStatus  = "Airborne...";
       } else if ((millis() - takeoffStart) > TAKEOFF_TIMEOUT_MS) {
+        // spike didnt lead to freefall within the window - probably not a real jump
         currentState = ARMED;
         deviceStatus = (currentJumpType == CMJ) ?
           "CMJ armed — stand still then jump." :
-          "SJ armed — hold squat then jump.";
+          "SJ armed — hold squat position then jump.";
       }
       break;
     }
@@ -412,6 +398,7 @@ void loop() {
     case AIRBORNE: {
       unsigned long timeInAir = (micros() - airborneStart) / 1000;
 
+      // safety timeout - if airborne for more than 2 seconds something went wrong
       if (timeInAir > MAX_FLIGHT_MS) {
         currentState = ARMED;
         deviceStatus = "Timeout — try again.";
@@ -419,6 +406,8 @@ void loop() {
         break;
       }
 
+      // minimum flight time filter - rejects very short events that arent real jumps
+      // cmj needs longer minimum because the countermovement can cause brief dips
       int minFlight = (currentJumpType == CMJ) ? MIN_FLIGHT_MS_CMJ : MIN_FLIGHT_MS_SJ;
       if (timeInAir < minFlight) break;
 
@@ -444,7 +433,7 @@ void loop() {
           float ratio  = lastCMJ / lastSJ;
           deviceStatus = "Done! CMJ/SJ ratio: " + String(ratio, 2);
         } else {
-          deviceStatus = label + " complete! Do next jump or view diagnostic.";
+          deviceStatus = label + " complete — do next jump or view diagnostic.";
         }
       }
       break;
@@ -455,5 +444,5 @@ void loop() {
       break;
   }
 
-  delay(5);  // 200Hz
+  delay(5);  // ~200hz sample rate
 }
