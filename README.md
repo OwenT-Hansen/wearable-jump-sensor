@@ -89,3 +89,88 @@ Commands sent from phone, results printed back wirelessly. No USB required durin
 ### Deprecated
 Flash storage and USB Serial data retrieval removed in favor of live BLE output.
 Time series plotter buffer removed — may be reintroduced for diagnostics later.
+
+
+## Phase 2: WiFi Web Interface & Jump Detection (July 2026)
+
+### Scope Change
+Narrowed project focus to two standardized athletic jumps with hands at sides:
+- **Squat Jump (SJ):** No countermovement, static start position
+- **Countermovement Jump (CMJ):** Downward dip then explosive upward drive
+
+This constraint eliminates arm swing and approach step interference, making
+signal processing more reliable and the athletic output more meaningful.
+
+### Interface: WiFi Access Point
+Abandoned BLE after extensive troubleshooting — the XIAO ESP32C3 BLE stack
+had consistent GATT connection failures across multiple libraries (NimBLE 1.4.x,
+NimBLE 2.5, standard ESP32 BLE) and two different phone apps. Root cause was
+never fully isolated but likely a combination of board package configuration
+and Android BLE stack compatibility.
+
+Switched to WiFi Access Point mode:
+- Chip broadcasts its own hotspot ("JumpTracker", password: jump1234)
+- User connects phone to hotspot and opens 192.168.4.1 in browser
+- No app required — fully browser-based interface
+- Works completely offline, no router needed
+
+### Signal Processing Challenges
+
+**Freefall detection at waist mount:**
+The MPU6050 at a waist mount does not snap instantly to 0 m/s² during
+freefall. The signal unloads gradually from ~9.8 down through the threshold
+over many samples. This caused systematic underreporting because the timer
+started late in the freefall descent.
+
+**Solution:** Raised freefall threshold from 3.0 to 9.0 m/s² — the timer now
+starts the moment gravity begins unloading rather than waiting for deep freefall.
+
+**CMJ squat dip false trigger:**
+The countermovement (squat down) phase briefly pushes |a| below the freefall
+threshold, causing the state machine to enter AIRBORNE during the squat rather
+than the actual jump.
+
+**Solution:** Added TAKEOFF state — requires a push-off spike above 18.0 m/s²
+before freefall can be accepted. This reflects real CMJ biomechanics: the
+explosive leg drive always precedes liftoff.
+
+**WiFi interference with timing:**
+`server.handleClient()` can block for 10-50ms during packet handling, disrupting
+the flight timer during an active jump.
+
+**Solution:** WiFi handling is blocked during TAKEOFF and AIRBORNE states —
+only runs during IDLE, ARMED, and LANDING.
+
+**Mount vibration:**
+Loose sensor mount caused false spikes mid-air. A secure, tight mount
+significantly cleaned up the signal.
+
+### State Machine
+```
+IDLE → ARMED → TAKEOFF → AIRBORNE → LANDING → IDLE
+```
+- **ARMED:** waiting for push-off spike above 18.0 m/s²
+- **TAKEOFF:** spike detected, waiting for signal to drop below 9.0 m/s²
+- **AIRBORNE:** timing flight, waiting for landing spike above 13.0 m/s²
+- **LANDING:** 1.5 second settle delay, then return to IDLE
+
+### Web Interface Features
+- CMJ and SJ buttons to arm the device
+- Full jump history per type with best and average
+- CMJ/SJ ratio with athletic interpretation
+- Diagnostic bar graph at /diag showing |a| signal colored by state
+- Reset button to clear session data
+
+### CMJ/SJ Ratio Benchmarks
+| Ratio | Interpretation |
+|---|---|
+| ≥ 1.15 | Excellent elastic energy utilization |
+| ≥ 1.08 | Good elastic energy utilization |
+| ≥ 1.00 | Average stretch-shortening benefit |
+| < 1.00 | Below average — CMJ not improving on SJ |
+
+### Known Limitations
+- Height consistently underreports vs video ground truth by ~15-20%
+- Timing offset likely due to gradual signal unloading at waist mount
+- Per-user calibration routine planned for future phase
+- Session data lost on power cycle —

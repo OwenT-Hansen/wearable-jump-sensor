@@ -32,9 +32,10 @@ const float Z_SCALE  =  0.9790;
 // Thresholds
 // ─────────────────────────────────────────
 const float TAKEOFF_THRESHOLD  = 18.0;
-const float FREEFALL_THRESHOLD = 9.0;
-const float LANDING_THRESHOLD  = 13.0;
-const int   MIN_FLIGHT_MS_SJ   = 100;
+const float FREEFALL_THRESHOLD_CMJ = 9.0;
+const float FREEFALL_THRESHOLD_SJ  = 8.0;
+const float LANDING_THRESHOLD  = 9.0;
+const int   MIN_FLIGHT_MS_SJ   = 200;
 const int   MIN_FLIGHT_MS_CMJ  = 300;
 const int   MAX_FLIGHT_MS      = 2000;
 const int   TAKEOFF_TIMEOUT_MS = 600;
@@ -87,7 +88,8 @@ Adafruit_MPU6050 mpu;
 // ─────────────────────────────────────────
 float calcHeight(float t) {
   float halfT = t / 2.0;
-  return 0.5 * 9.81 * halfT * halfT;
+  float raw   = 0.5 * 9.81 * halfT * halfT;
+  return max(0.0f, raw - 0.071f);  // 7.1cm empirical calibration offset
 }
 
 // ─────────────────────────────────────────
@@ -230,8 +232,7 @@ void handleDiag() {
     if (pct > 100) pct = 100;
 
     String color = "#00d4ff";
-    if (val < FREEFALL_THRESHOLD) color = "#00ff88";
-    if (val > LANDING_THRESHOLD)  color = "#ff4444";
+    "<span style='color:#00ff88'>■ Freefall</span>";
 
     bars += "<div style='display:flex;align-items:center;margin:1px 0;'>"
             "<span style='width:38px;font-size:10px;color:#aaa;'>"
@@ -256,7 +257,7 @@ void handleDiag() {
 <body>
   <h2>Jump Diagnostic</h2>
   <div class='legend'>
-    <span style='color:#00ff88'>■ Freefall (&lt;)" + String(FREEFALL_THRESHOLD, 1) + R"()</span>
+    <span style='color:#00ff88'>■ Freefall</span>
     <span style='color:#ff4444'>■ Landing (&gt;)" + String(LANDING_THRESHOLD, 1) + R"()</span>
     <span style='color:#00d4ff'>■ Normal</span>
   </div>
@@ -391,8 +392,11 @@ void loop() {
       }
       break;
 
-    case TAKEOFF:
-      if (totalAccel < FREEFALL_THRESHOLD) {
+    case TAKEOFF: {
+      float freefallThresh = (currentJumpType == CMJ) ?
+        FREEFALL_THRESHOLD_CMJ : FREEFALL_THRESHOLD_SJ;
+
+      if (totalAccel < freefallThresh) {
         currentState  = AIRBORNE;
         airborneStart = micros();
         deviceStatus  = "Airborne...";
@@ -403,6 +407,7 @@ void loop() {
           "SJ armed — hold squat then jump.";
       }
       break;
+    }
 
     case AIRBORNE: {
       unsigned long timeInAir = (micros() - airborneStart) / 1000;
